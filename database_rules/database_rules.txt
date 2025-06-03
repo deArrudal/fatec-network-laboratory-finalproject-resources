@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# Limpar regras anteriores
+nft flush ruleset
+
+# Criar tabela filter
+nft add table ip filter
+
+# Criar chains principais
+nft add chain ip filter input { type filter hook input priority 0 \; policy drop \; }
+nft add chain ip filter output { type filter hook output priority 0 \; policy accept \; }
+
+# Permitir tráfego local (loopback)
+nft add rule ip filter input iif lo accept
+
+# Permitir conexões estabelecidas e relacionadas
+nft add rule ip filter input ct state established,related accept
+
+# Permitir SSH somente da rede interna
+nft add rule ip filter input iif enp0s3 ip saddr 192.168.200.0/24 tcp dport 22 accept
+
+# Permitir acesso ao MySQL (3306) SOMENTE da vmServidor (192.168.200.4)
+nft add rule ip filter input ip saddr 192.168.200.4 tcp dport 3306 accept

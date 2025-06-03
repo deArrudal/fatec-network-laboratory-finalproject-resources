@@ -1,0 +1,355 @@
+0.Update the vm hostname
+
+sudo hostnamectl set-hostname YOURNAME
+sudo nano /etc/hostname
+sudo nano /etc/hosts
+
+##### System-Level Setup #####
+1.Create a Unix Group for Cert Management and add userlinux and appuser to it:
+
+sudo groupadd certadmins
+sudo adduser --disabled-password --gecos "" appuser
+sudo usermod -aG certadmins appuser
+sudo usermod -aG certadmins userlinux
+
+sudo reboot
+
+2.Install OpenVPN and Easy-RSA
+
+sudo apt update
+sudo apt install openvpn easy-rsa -y
+
+3.Create PKI workspace in a shared but secure location:
+
+sudo mkdir -p /opt/easy-rsa
+sudo cp -r /usr/share/easy-rsa/* /opt/easy-rsa
+sudo chown -R root:certadmins /opt/easy-rsa
+sudo chmod -R 770 /opt/easy-rsa
+
+4.Initialize PKI:
+
+cd /opt/easy-rsa
+./easyrsa init-pki
+./easyrsa build-ca nopass
+	common name: vmserver
+./easyrsa build-server-full vmserver nopass
+./easyrsa sign-req server vmserver
+./easyrsa gen-dh
+openvpn --genkey tls-crypt-v2-server pki/private/vmserver.pem
+./easyrsa gen-crl
+
+sudo chown -R root:certadmins /opt/easy-rsa
+sudo chmod -R 770 /opt/easy-rsa
+
+5.Copy server certs to OpenVPN:
+
+sudo cp pki/ca.crt /etc/openvpn/server/
+sudo cp pki/dh.pem /etc/openvpn/server/
+sudo cp pki/crl.pem /etc/openvpn/server/
+sudo cp pki/issued/vmserver.crt /etc/openvpn/server/
+sudo cp pki/private/vmserver.key /etc/openvpn/server/
+sudo cp pki/private/vmserver.pem /etc/openvpn/server/
+
+6.Configure OpenVPN server (/etc/openvpn/server/server.conf), NAT rules, and UFW as per your original instructions.
+#-------------------- 
+# VPN listening settings
+port 1194
+proto udp
+dev tun
+
+# Certificate settings
+ca ca.crt
+cert vmserver.crt
+key vmserver.key
+tls-crypt-v2 vmserver.pem
+dh dh.pem
+crl-verify crl.pem
+
+# VPN subnet
+server 10.8.0.0 255.255.255.0
+
+# Route internal LAN to clients
+push "route 192.168.200.0 255.255.255.0"
+
+# Optional: Route all Internet traffic through VPN (you can remove this if VPN is for internal access only)
+# push "redirect-gateway def1 bypass-dhcp"
+# push "dhcp-option DNS 1.1.1.1"
+# push "dhcp-option DNS 8.8.8.8"
+
+# Maintain IP bindings
+ifconfig-pool-persist /var/log/openvpn/ipp.txt
+
+# Connection maintenance
+keepalive 10 120
+
+# Security
+cipher AES-256-GCM
+persist-key
+persist-tun
+
+# Logging
+status /var/log/openvpn/openvpn-status.log
+verb 4
+explicit-exit-notify 1
+
+#----------------------------------------- 
+
+7.Enabling forwarding on the Open VPN server
+
+sudo nano /etc/sysctl.conf
+net.ipv4.ip_forward = 1
+sudo sysctl -p
+
+8.Start and enable the OpenVPN service:
+
+sudo systemctl start openvpn-server@server
+sudo systemctl enable openvpn-server@server
+
+
+##### Application-Level Certificate Management #####
+1.Ensure Python script is installed in /opt/easy-rsa/ and the necessary directories are created:
+
+sudo mkdir -p /opt/easy-rsa/exports
+sudo mkdir -p /opt/easy-rsa/client-configs
+
+sudo cp create_certificate_client.py /opt/easy-rsa/
+sudo cp revoke_certificate_client.py /opt/easy-rsa/
+
+sudo chown -R root:certadmins /opt/easy-rsa/
+sudo chmod -R 770 /opt/easy-rsa/
+
+2.Run the script as appuser:
+
+python3 /opt/easy-rsa/scripts/create_certificate_client.py clientname uniqueid
+
+----------------------------------------------------
+create_certificate_client.py
+
+#!/usr/bin/env python3
+
+import os
+import sys
+import shutil
+import socket
+import subprocess
+import zipfile
+import logging
+
+
+SERVER_NAME = "vmserver"
+REFERENCE_PATH = "/opt/easy-rsa"
+TARGET_PATH = os.path.join(REFERENCE_PATH, "client-configs")
+EXPORT_BASE = "/opt/easy-rsa/exports"
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+def get_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to determine external IP: {e}")
+
+
+def create_zip(zip_filename, files):
+    with zipfile.ZipFile(zip_filename, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for file in files:
+            if os.path.isfile(file):
+                zipf.write(file, arcname=os.path.basename(file))
+
+            else:
+                logger.warning(f"File missing for zip: {file}")
+
+    logger.info(f"ZIP archive created at: {zip_filename}")
+
+
+def main(client, id):
+    try:
+        client_path = os.path.join(TARGET_PATH, client, id)
+        os.makedirs(client_path, exist_ok=True)
+
+        os.makedirs(EXPORT_BASE, exist_ok=True)
+
+        pki_path = os.path.join(REFERENCE_PATH, "pki")
+        issued_path = os.path.join(pki_path, "issued")
+        private_path = os.path.join(pki_path, "private")
+
+        ca_crt = os.path.join(pki_path, "ca.crt")
+        id_crt = os.path.join(issued_path, f"{id}.crt")
+        id_key = os.path.join(private_path, f"{id}.key")
+        id_pem = os.path.join(private_path, f"{id}.pem")
+        id_ovpn = os.path.join(client_path, f"{id}.ovpn")
+
+        logger.info(f"Generating certificate request for {id}")
+        subprocess.run(
+            ["./easyrsa", "--batch", "gen-req", id, "nopass"],
+            cwd=REFERENCE_PATH,
+            check=True,
+        )
+
+        logger.info(f"Signing certificate for {id}")
+        subprocess.run(
+            ["./easyrsa", "--batch", "sign-req", "client", id],
+            cwd=REFERENCE_PATH,
+            check=True,
+        )
+
+        logger.info(f"Creating TLS Crypt v2 Key for {id}")
+        subprocess.run(
+            [
+                "/usr/sbin/openvpn",
+                "--tls-crypt-v2",
+                f"private/{SERVER_NAME}.pem",
+                "--genkey",
+                "tls-crypt-v2-client",
+                f"private/{id}.pem",
+            ],
+            cwd=pki_path,
+            check=True,
+        )
+
+        for required_file in [ca_crt, id_crt, id_key, id_pem]:
+            if not os.path.isfile(required_file):
+                raise FileNotFoundError(f"Missing required file: {required_file}")
+
+        ip = get_ip()
+
+        logger.info("Creating .ovpn configuration")
+        with open(id_ovpn, "w") as f:
+            f.write(f"""client
+proto udp
+dev tun
+remote {ip} 1194
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-GCM
+#user nobody
+#group nobody
+verb 3
+
+ca ca.crt
+cert {id}.crt
+key {id}.key
+tls-crypt-v2 {id}.pem
+""")
+
+        for src in [ca_crt, id_crt, id_key, id_pem]:
+            shutil.copy(src, client_path)
+
+        zip_name = os.path.join(EXPORT_BASE, f"{client}_{id}.zip")
+        create_zip(zip_name, [ca_crt, id_crt, id_key, id_pem, id_ovpn])
+
+        logger.info(f"Client config package ready at: {zip_name}")
+        print(f"Client config package ready at: {zip_name}")
+        sys.exit(0)
+
+    except Exception as e:
+        logger.error(f"Error during client certificate creation: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: create_certificate_client.py <client_name> <id>")
+        sys.exit(1)
+
+    main(sys.argv[1], sys.argv[2])
+
+----------------------------------------------------
+revoke_certificate_client.py
+
+#!/usr/bin/env python3
+
+import os
+import sys
+import shutil
+import subprocess
+import logging
+
+REFERENCE_PATH = "/opt/easy-rsa"
+TARGET_PATH = os.path.join(REFERENCE_PATH, "client-configs")
+EXPORT_PATH = "/opt/easy-rsa/exports"
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+def revoke_certificate(client, id):
+    try:
+        client_path = os.path.join(TARGET_PATH, client, id)
+        zip_path = os.path.join(EXPORT_PATH, f"{client}_{id}.zip")
+
+        pki_path = os.path.join(REFERENCE_PATH, "pki")
+        issued_path = os.path.join(pki_path, "issued")
+        private_path = os.path.join(pki_path, "private")
+
+        id_crt = os.path.join(issued_path, f"{id}.crt")
+        id_key = os.path.join(private_path, f"{id}.key")
+        id_pem = os.path.join(private_path, f"{id}.pem")
+
+        logger.info(f"Revoking certificate for client '{id}'")
+        subprocess.run(
+            ["./easyrsa", "--batch", "revoke", id],
+            cwd=REFERENCE_PATH,
+            check=True,
+        )
+
+        logger.info("Regenerating CRL")
+        subprocess.run(
+            ["./easyrsa", "gen-crl"],
+            cwd=REFERENCE_PATH,
+            check=True,
+        )
+
+        for file in [id_crt, id_key, id_pem]:
+            if os.path.exists(file):
+                os.remove(file)
+                logger.info(f"Deleted: {file}")
+
+            else:
+                logger.warning(f"File not found (skipped): {file}")
+
+        if os.path.isdir(client_path):
+            shutil.rmtree(client_path)
+            logger.info(f"Deleted client config directory: {client_path}")
+
+        else:
+            logger.warning(f"Client directory not found: {client_path}")
+
+        if os.path.isfile(zip_path):
+            os.remove(zip_path)
+            logger.info(f"Deleted ZIP archive: {zip_path}")
+
+        else:
+            logger.warning(f"ZIP archive not found: {zip_path}")
+
+        logger.info(f"Client '{id}' successfully revoked.")
+        print(f"Client '{id}' successfully revoked.")
+        sys.exit(0)
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Subprocess failed: {e}", exc_info=True)
+        sys.exit(1)
+
+    except Exception as e:
+        logger.error(f"Error revoking client '{id}': {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: revoke_client.py <client_name> <id>")
+        sys.exit(1)
+
+    revoke_certificate(sys.argv[1], sys.argv[2])
