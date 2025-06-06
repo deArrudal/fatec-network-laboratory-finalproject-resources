@@ -1,4 +1,4 @@
-0.Update the vm hostname
+0.Update the vm hostname - optional
 
 sudo hostnamectl set-hostname YOURNAME
 sudo nano /etc/hostname
