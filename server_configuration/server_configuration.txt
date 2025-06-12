@@ -118,6 +118,8 @@ sudo cp revoke_certificate_client.py /opt/easy-rsa/
 sudo chown -R root:certadmins /opt/easy-rsa/
 sudo chmod -R 770 /opt/easy-rsa/
 
+sudo find /opt/easy-rsa -type d -exec chmod g+s {} \;
+
 2.Run the script as appuser:
 
 python3 /opt/easy-rsa/scripts/create_certificate_client.py clientname uniqueid
